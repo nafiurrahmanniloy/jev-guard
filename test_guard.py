@@ -116,6 +116,21 @@ class Transcript(unittest.TestCase):
         self.assertEqual(claude, "Fixed. Want me to commit?")
 
 
+class LongSessions(unittest.TestCase):
+    def test_user_messages_found_behind_lots_of_tool_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "s.jsonl")
+            with open(path, "w") as f:
+                for text in ("first ask", "commit it when done"):
+                    f.write(json.dumps({"type": "user", "message": {"content": text}}) + "\n")
+                blob = "x" * 5000
+                for _ in range(200):  # ~1 MB of tool output after the last user message
+                    f.write(json.dumps({"type": "user", "message": {"content": [{"type": "tool_result", "content": blob}]}}) + "\n")
+            self.assertEqual(guard.messages_from_rows(guard.read_tail_rows(path)), [])  # the old way saw nothing
+            user, _ = guard.conversation_context(guard.recent_messages(path, 3), 3)
+            self.assertEqual(user, ["first ask", "commit it when done"])
+
+
 class Decisions(unittest.TestCase):
     msgs = [("user", "commit it"), ("claude", "Committing now.")]
 
@@ -291,6 +306,21 @@ class ChangeCheck(unittest.TestCase):
     def test_mention_only_never_asks_about_change(self):
         r, _ = self.evaluate('grep -rn "git commit -m x" .', performs=0.05, unrelated=0.99)
         self.assertEqual(r["decision"], "pass")
+
+    def test_commit_message_mentioning_a_merge_is_still_a_commit(self):
+        cmd = "git add a.txt && git commit -q -F - <<'EOF'\nfix: guard now checks gh pr merge and gh pr create\nEOF"
+        self.assertEqual(guard.change_action_in(cmd, ["merge_pr", "open_pr", "commit"]), "commit")
+        self.assertNotIn("gh pr merge", guard.strip_heredoc_bodies(cmd))
+        self.assertEqual(guard.change_action_in("git push && gh pr merge 5", ["merge_pr", "push"]), "merge_pr")
+
+    def test_approved_plan_counts_as_user_words(self):
+        rows = [{"type": "user", "message": {"content": "yes plan it and build both"}},
+                {"type": "user", "message": {"content": [{"type": "tool_result", "content":
+                    "User has approved your plan. You can now start coding.\n\n## Approved Plan:\n# Build\n5. Commit and push to the public repo."}]}}]
+        user, _ = guard.conversation_context(guard.messages_from_rows(rows), 3)
+        self.assertEqual(user[0], "yes plan it and build both")
+        self.assertTrue(user[1].startswith("[approved plan] # Build"))
+        self.assertIn("Commit and push", user[1])
 
     def test_merge_reads_the_pr(self):
         def fake_run(folder, *args, timeout=8):

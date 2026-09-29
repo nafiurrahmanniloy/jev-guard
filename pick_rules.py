@@ -89,7 +89,7 @@ def run(payload, config, key_info, jev=None):
     if key_info is None:
         entry["error"] = "no Jev key"
         return None, entry
-    _, claude_last = guard.conversation_context(guard.messages_from_rows(guard.read_tail_rows(transcript)), 1)
+    _, claude_last = guard.conversation_context(guard.messages_from_rows(guard.read_tail_rows(transcript)), 1)  # only needs the last reply
     started = time.monotonic()
     try:
         picks, resp = pick(prompt, claude_last, mems, settings, key_info, jev)

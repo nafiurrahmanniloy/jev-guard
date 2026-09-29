@@ -43,6 +43,7 @@ REPLAY_LOG_PATH = os.path.join(HERE, "replay.jsonl")
 TRANSCRIPTS_GLOB = os.path.expanduser("~/.claude/projects/*/*.jsonl")
 
 MAX_MESSAGE_CHARS = 600    # per user message sent to Jev
+MAX_PLAN_CHARS = 4000     # an approved plan counts as a user message; keep enough of it to see its steps
 MAX_CLAUDE_CHARS = 800     # Claude's last message
 MAX_COMMAND_CHARS = 3000
 TAIL_BYTES = 400_000       # read only the end of the transcript
@@ -157,6 +158,10 @@ def messages_from_rows(rows):
                         m = _REJECTION.search(body or "")
                         if m:  # the user's words typed while rejecting a tool call
                             out.append(("user", _clean(m.group(1))))
+                        elif (body or "").startswith("User has approved your plan"):  # an approved plan is the user's yes
+                            plan = (body.split("## Approved Plan:", 1) + [""])[1].strip()
+                            if plan:
+                                out.append(("user", "[approved plan] " + plan))
         elif t == "attachment":
             a = r.get("attachment") or {}
             if a.get("type") == "queued_command" and (a.get("origin") or {}).get("kind") == "human":
@@ -170,13 +175,13 @@ def messages_from_rows(rows):
     return out
 
 
-def read_tail_rows(path):
+def read_tail_rows(path, tail_bytes=TAIL_BYTES):
     rows = []
     try:
         size = os.path.getsize(path)
         with open(path, "rb") as f:
-            if size > TAIL_BYTES:
-                f.seek(size - TAIL_BYTES)
+            if size > tail_bytes:
+                f.seek(size - tail_bytes)
                 f.readline()  # drop the partial first line
             for line in f:
                 try:
@@ -188,11 +193,26 @@ def read_tail_rows(path):
     return rows
 
 
+def recent_messages(path, n_user):
+    """Messages from the end of the transcript, reading further back until `n_user` of the user's own
+    messages are found. Long stretches of tool output can push them far from the end of the file."""
+    tail = TAIL_BYTES
+    while True:
+        messages = messages_from_rows(read_tail_rows(path, tail))
+        try:
+            whole = tail >= os.path.getsize(path)
+        except OSError:
+            return messages
+        if whole or sum(1 for who, _ in messages if who == "user") >= n_user:
+            return messages
+        tail *= 4
+
+
 def conversation_context(messages, n_recent):
     user = [m for who, m in messages if who == "user"][-n_recent:]
     claude = [m for who, m in messages if who == "claude"]
     return (
-        [redact(m)[:MAX_MESSAGE_CHARS] for m in user],
+        [redact(m)[:MAX_PLAN_CHARS if m.startswith("[approved plan]") else MAX_MESSAGE_CHARS] for m in user],
         redact(claude[-1])[:MAX_CLAUDE_CHARS] if claude else None,
     )
 
@@ -288,6 +308,34 @@ def pending_commit_diff(command, folder):
     return diff
 
 
+def strip_heredoc_bodies(command):
+    """The command with heredoc bodies removed: text inside `<<EOF … EOF` is data (a commit message,
+    a script), so a commit message that mentions `gh pr merge` must not look like a merge."""
+    out, pos = [], 0
+    for m in re.finditer(r"<<-?\s*['\"]?(\w+)['\"]?", command):
+        if m.start() < pos:
+            continue
+        line_end = command.find("\n", m.end())
+        if line_end == -1:
+            break
+        end = re.search(rf"^\s*{re.escape(m.group(1))}\s*$", command[line_end + 1:], re.M)
+        if not end:
+            break
+        out.append(command[pos:line_end + 1])
+        pos = line_end + 1 + end.start()
+    out.append(command[pos:])
+    return "".join(out)
+
+
+def change_action_in(command, action_ids):
+    """Which change the command really performs, judged outside heredoc bodies: merge, PR create or commit."""
+    shell = strip_heredoc_bodies(command)
+    for action, pattern in (("merge_pr", _PR_MERGE), ("open_pr", _PR_CREATE), ("commit", _COMMIT)):
+        if action in action_ids and pattern.search(shell):
+            return action
+    return None
+
+
 def gather_change(command, folder, action_ids):
     """(description, diff) for the commit / PR in `command`, or (None, reason) when it can't be read."""
     if "merge_pr" in action_ids:
@@ -342,9 +390,6 @@ def build_request(actions, state, model, change_question=None):
     if change_question:
         questions["change__unrelated"] = {"type": "noul", **change_question}
     return {"model": model, "state": state, "questions": questions}
-
-
-CHANGE_ACTIONS = ("merge_pr", "open_pr", "commit")  # the first one present is the change that gets checked
 
 
 def add_change_state(state, command, folder, action_ids, config):
@@ -425,10 +470,10 @@ def evaluate(command, cwd, messages, config, key_info, jev=None):
     else:
         endpoint, model, key = key_info
         cc = config.get("change_check") or {}
-        change_action = next((a for a in CHANGE_ACTIONS if a in result["actions"]), None) if cc.get("enabled") else None
+        change_action = change_action_in(command, result["actions"]) if cc.get("enabled") else None
         if change_action:
             result["change"] = {"action": change_action,
-                                **add_change_state(state, command, folder, result["actions"], config)}
+                                **add_change_state(state, command, folder, [change_action], config)}
         started = time.monotonic()
         try:
             question = cc.get("question") if "commit" in state else None
@@ -491,7 +536,7 @@ def hook():
         return 0  # most commands: nothing read, nothing sent, nothing logged
 
     try:
-        messages = messages_from_rows(read_tail_rows(payload.get("transcript_path") or ""))
+        messages = recent_messages(payload.get("transcript_path") or "", config["recent_messages"])
         result = evaluate(command, cwd, messages, config, load_key())
     except Exception as e:  # a crash on a risky command must be visible and fail to on_error, never silently pass
         result = {"hard_stops": [], "actions": [a["id"] for a in match_actions(command, config)], "verdicts": {},
