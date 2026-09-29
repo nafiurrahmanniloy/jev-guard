@@ -29,6 +29,7 @@ import glob
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -114,11 +115,20 @@ def in_scope(cwd, config):
 
 # ── transcript → what the user and Claude last said ─────────────────────────
 _REJECTION = re.compile(r"the user said:\s*\n(.+)", re.S)
-_REMINDER = re.compile(r"<system-reminder>.*?</system-reminder>", re.S)
+_REMINDER = re.compile(r"<system-reminder>.*?</system-reminder>|<pasted_content\b[^>]*>.*?</pasted_content>", re.S)
+# Stored as user turns but not the user's words: background-task events, slash-command echoes,
+# and the summary Claude Code writes when a session continues after running out of context.
+_NOT_USER_WORDS = ("<task-notification", "<command-", "<local-command", "This session is being continued")
 
 
 def _clean(text):
-    return _REMINDER.sub("", text or "").strip()
+    """Message text without injected reminders. Accepts a string or a list of content blocks
+    (a message sent with an image arrives as [{"type": "image"}, {"type": "text", ...}])."""
+    if isinstance(text, list):
+        text = " ".join(b.get("text") or "" for b in text if isinstance(b, dict) and b.get("type") == "text")
+    if not isinstance(text, str):
+        return ""
+    return _REMINDER.sub("", text).strip()
 
 
 def messages_from_rows(rows):
@@ -130,7 +140,7 @@ def messages_from_rows(rows):
             content = (r.get("message") or {}).get("content")
             if isinstance(content, str):
                 text = _clean(content)
-                if text and not text.startswith("<command-") and not text.startswith("<local-command"):
+                if text and not text.startswith(_NOT_USER_WORDS):
                     out.append(("user", text))
             elif isinstance(content, list):
                 for c in content:
@@ -138,7 +148,7 @@ def messages_from_rows(rows):
                         continue
                     if c.get("type") == "text":
                         text = _clean(c.get("text"))
-                        if text:
+                        if text and not text.startswith(_NOT_USER_WORDS):
                             out.append(("user", text))
                     elif c.get("type") == "tool_result":
                         body = c.get("content")
@@ -207,6 +217,113 @@ def git_branch(folder):
         return None
 
 
+# ── change check: does the change match its description? ─────────────────────
+_COMMIT = re.compile(r"\bgit(?:\s+-C\s+\S+)?\s+commit\b")
+_PR_CREATE = re.compile(r"\bgh\s+pr\s+create\b")
+_PR_MERGE = re.compile(r"\bgh\s+pr\s+merge\b")
+
+
+def _run(folder, *args, timeout=8):
+    try:
+        out = subprocess.run(list(args), cwd=folder, capture_output=True, text=True, timeout=timeout)
+        return out.stdout if out.returncode in (0, 1) else ""  # `git diff --no-index` exits 1 when files differ
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def _heredoc_after(command, pos):
+    """Body of the first heredoc whose `<<WORD` starts on the same line as `pos`."""
+    line_end = command.find("\n", pos)
+    line = command[pos:] if line_end == -1 else command[pos:line_end]
+    m = re.search(r"<<-?\s*['\"]?(\w+)['\"]?", line)
+    if not m or line_end == -1:
+        return None
+    end = re.search(rf"^\s*{re.escape(m.group(1))}\s*$", command[line_end + 1:], re.M)
+    return command[line_end + 1: line_end + 1 + end.start()].rstrip("\n") if end else None
+
+
+def _quoted_values(text, flags):
+    """Values of `flag "..."` / `flag '...'` / `flag word` for any of `flags`, in order."""
+    pat = rf"(?:^|\s)(?:{'|'.join(map(re.escape, flags))})(?:\s+|=)(\"(?:[^\"\\]|\\.)*\"|'[^']*'|[^\s;&|]+)"
+    return [v[1:-1] if v[:1] in "\"'" else v for v in re.findall(pat, text)]
+
+
+def commit_message(command, folder):
+    """The message `git commit` in `command` will use, read from the command itself. None if unreadable."""
+    m = _COMMIT.search(command)
+    if not m:
+        return None
+    line = command[m.start():].split("\n", 1)[0]
+    if "<<" in line:                                       # -F - <<'EOF' … or -m "$(cat <<'EOF' …)"
+        return _heredoc_after(command, m.start())
+    f = _quoted_values(line, ["-F", "--file"])
+    if f and f[0] != "-":                                  # -F path: written earlier in this command, or on disk
+        w = re.search(rf"cat\s*>\s*['\"]?{re.escape(f[0])}['\"]?\s*<<", command)
+        if w:
+            return _heredoc_after(command, w.start())
+        path = os.path.join(folder, os.path.expanduser(f[0]))
+        try:
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                return fh.read()
+        except OSError:
+            return None
+    msgs = _quoted_values(line, ["-m", "--message"])
+    return "\n\n".join(msgs) if msgs else None
+
+
+def pending_commit_diff(command, folder):
+    """What the commit would contain: already-staged changes plus files `git add`-ed earlier in the same command."""
+    diff = _run(folder, "git", "diff", "--cached", "--no-color")
+    head = command[:_COMMIT.search(command).start()]
+    paths = []
+    for m in re.finditer(r"\bgit(?:\s+-C\s+\S+)?\s+add\s+([^;&|\n]+)", head):
+        try:
+            paths += [t for t in shlex.split(m.group(1)) if not t.startswith("-")]
+        except ValueError:
+            continue
+    if paths:
+        diff += _run(folder, "git", "diff", "--no-color", "--", *paths)
+        for f in _run(folder, "git", "ls-files", "--others", "--exclude-standard", "--", *paths).split()[:20]:
+            diff += _run(folder, "git", "diff", "--no-color", "--no-index", "/dev/null", f)
+    return diff
+
+
+def gather_change(command, folder, action_ids):
+    """(description, diff) for the commit / PR in `command`, or (None, reason) when it can't be read."""
+    if "merge_pr" in action_ids:
+        num = re.search(r"\bgh\s+pr\s+merge\s+(\d+)", command)
+        args = [num.group(1)] if num else []
+        view = _run(folder, "gh", "pr", "view", *args, "--json", "title,body", timeout=10)
+        diff = _run(folder, "gh", "pr", "diff", *args, timeout=15)
+        try:
+            v = json.loads(view)
+        except ValueError:
+            return None, "could not read the PR (gh pr view failed)"
+        return f"{v.get('title', '')}\n\n{v.get('body') or ''}", diff
+    if "open_pr" in action_ids:
+        line = command[_PR_CREATE.search(command).start():].split("\n", 1)[0]
+        title = (_quoted_values(line, ["--title", "-t"]) or [""])[0]
+        body = _heredoc_after(command, _PR_CREATE.search(command).start()) if "<<" in line else \
+            (_quoted_values(line, ["--body", "-b"]) or [""])[0]
+        base = (_quoted_values(line, ["--base", "-B"]) or [None])[0]
+        if not base:
+            ref = _run(folder, "git", "symbolic-ref", "--short", "refs/remotes/origin/HEAD").strip()
+            base = ref or "origin/main"
+        elif "/" not in base:
+            base = f"origin/{base}"
+        if not title:
+            title = _run(folder, "git", "log", "-1", "--format=%s").strip()
+        return f"{title}\n\n{body}", _run(folder, "git", "diff", "--no-color", f"{base}...HEAD")
+    msg = commit_message(command, folder)
+    if not msg:
+        return None, "could not read the commit message from the command"
+    return msg, pending_commit_diff(command, folder)
+
+
+def changed_files(diff):
+    return list(dict.fromkeys(re.findall(r"^diff --git a/(\S+)", diff, re.M)))
+
+
 def match_hard_stops(command, config):
     return [h for h in config["hard_stops"] if re.search(h["pattern"], command, re.I | re.M)]
 
@@ -217,12 +334,29 @@ def match_actions(command, config):
     return [a for a in hits if a["id"] not in overridden]
 
 
-def build_request(actions, state, model):
+def build_request(actions, state, model, change_question=None):
     questions = {}
     for a in actions:
         questions[f"{a['id']}__performs"] = {"type": "noul", **a["performs"]}
         questions[f"{a['id']}__approved"] = {"type": "noul", **a["approved"]}
+    if change_question:
+        questions["change__unrelated"] = {"type": "noul", **change_question}
     return {"model": model, "state": state, "questions": questions}
+
+
+CHANGE_ACTIONS = ("merge_pr", "open_pr", "commit")  # the first one present is the change that gets checked
+
+
+def add_change_state(state, command, folder, action_ids, config):
+    """Put the commit/PR description + diff into `state["commit"]`. Returns the log record for it."""
+    desc, diff = gather_change(command, folder, action_ids)
+    if desc is None:
+        return {"skipped": diff}
+    if not diff.strip():
+        return {"skipped": "empty diff"}
+    cap = config["change_check"].get("max_diff_chars", 60000)
+    state["commit"] = redact(desc)[:4000] + "\n\n" + redact(diff)[:cap]
+    return {"files": changed_files(diff)[:40], "diff_chars": len(diff), "truncated": len(diff) > cap}
 
 
 def call_jev(body, endpoint, key, timeout):
@@ -264,7 +398,7 @@ def evaluate(command, cwd, messages, config, key_info, jev=None):
     """Core shared by the hook and --replay. Returns a result dict."""
     jev = jev or call_jev
     result = {"hard_stops": [], "actions": [], "decision": "pass", "reason": None,
-              "verdicts": {}, "error": None, "ms": None, "tokens": None}
+              "verdicts": {}, "change": None, "error": None, "ms": None, "tokens": None}
     stops = match_hard_stops(command, config)
     if stops:
         result.update(hard_stops=[h["id"] for h in stops], decision="deny",
@@ -290,16 +424,31 @@ def evaluate(command, cwd, messages, config, key_info, jev=None):
         result["error"] = "no Jev key (put TYPESAFE_API_KEY or AI_GATEWAY_API_KEY in .env)"
     else:
         endpoint, model, key = key_info
+        cc = config.get("change_check") or {}
+        change_action = next((a for a in CHANGE_ACTIONS if a in result["actions"]), None) if cc.get("enabled") else None
+        if change_action:
+            result["change"] = {"action": change_action,
+                                **add_change_state(state, command, folder, result["actions"], config)}
         started = time.monotonic()
         try:
-            resp = jev(build_request(actions, state, model), endpoint, key, config["timeout_seconds"])
+            question = cc.get("question") if "commit" in state else None
+            resp = jev(build_request(actions, state, model, question), endpoint, key, config["timeout_seconds"])
             result["ms"] = int((time.monotonic() - started) * 1000)
             result["tokens"] = (resp.get("usage") or {}).get("input_tokens")
-            verdicts, needs_ask = decide(actions, resp.get("answers"), config)
+            answers = resp.get("answers")
+            verdicts, needs_ask = decide(actions, answers, config)
             result["verdicts"] = verdicts
-            if needs_ask:
-                parts = [f"{a['label']} (Jev is {round(p * 100)}% sure you said yes; needs {round(a['threshold'] * 100)}%)"
-                         for a, p in needs_ask]
+            parts = [f"{a['label']} (Jev is {round(p * 100)}% sure you said yes; needs {round(a['threshold'] * 100)}%)"
+                     for a, p in needs_ask]
+            if question:
+                unrelated = noul(answers, "change__unrelated")
+                result["change"]["unrelated"] = round(unrelated, 3)
+                if unrelated >= cc["threshold"] and verdicts[change_action]["verdict"] != "skip":
+                    label = next(a["label"] for a in actions if a["id"] == change_action)
+                    files = result["change"]["files"]
+                    parts.append(f"{label}, but Jev is {round(unrelated * 100)}% sure it includes changes that don't match "
+                                 f"its description. Files: {', '.join(files[:8])}{' …' if len(files) > 8 else ''}")
+            if parts:
                 result.update(decision="ask", reason="Jev rule check: about to " + "; ".join(parts) + ".")
             return result
         except urllib.error.HTTPError as e:
@@ -341,13 +490,18 @@ def hook():
     if not match_hard_stops(command, config) and not match_actions(command, config):
         return 0  # most commands: nothing read, nothing sent, nothing logged
 
-    messages = messages_from_rows(read_tail_rows(payload.get("transcript_path") or ""))
-    result = evaluate(command, cwd, messages, config, load_key())
+    try:
+        messages = messages_from_rows(read_tail_rows(payload.get("transcript_path") or ""))
+        result = evaluate(command, cwd, messages, config, load_key())
+    except Exception as e:  # a crash on a risky command must be visible and fail to on_error, never silently pass
+        result = {"hard_stops": [], "actions": [a["id"] for a in match_actions(command, config)], "verdicts": {},
+                  "decision": "ask" if config["on_error"] == "ask" else "pass", "error": f"guard crash: {type(e).__name__}: {e}",
+                  "reason": f"Jev rule check crashed ({type(e).__name__}). Approve this command yourself?", "change": None, "ms": None, "tokens": None}
     append_log(LOG_PATH, {
         "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "session": payload.get("session_id"),
         "mode": config["mode"], "folder": os.path.relpath(os.path.realpath(cwd), scope_roots(config)[0]),
         "command": redact(command)[:300],
-        **{k: result[k] for k in ("hard_stops", "actions", "verdicts", "decision", "error", "ms", "tokens")},
+        **{k: result[k] for k in ("hard_stops", "actions", "verdicts", "change", "decision", "error", "ms", "tokens")},
     })
     if config["mode"] != "enforce" or result["decision"] == "pass":
         return 0
@@ -380,12 +534,26 @@ def stats():
         print(f"Jev time: median {timed[len(timed) // 2]} ms, slowest {timed[-1]} ms")
     for r in rows[-5:]:
         print(f"  {r['ts']}  {r['mode']:7}  {r['decision']:4}  {r['command'][:80]}")
+    changes = [r["change"] for r in rows if r.get("change")]
+    if changes:
+        flagged = [c for c in changes if (c.get("unrelated") or 0) >= 0.5]
+        print(f"Change checks: {len(changes)}  (flagged {len(flagged)}, skipped {sum(1 for c in changes if 'skipped' in c)})")
+    try:
+        with open(os.path.join(HERE, "rules_log.jsonl"), encoding="utf-8") as f:
+            picks = [json.loads(l) for l in f if l.strip()]
+    except OSError:
+        picks = []
+    if picks:
+        errs = [p for p in picks if p.get("error")]
+        print(f"Rules picker: {len(picks)} messages, {sum(1 for p in picks if p['picks'])} with picks, {len(errs)} errors"
+              + (f"  (last: {errs[-1]['error'][:80]})" if errs else ""))
     return 0
 
 
 def replay(limit=None):
     """Run every past in-scope risky command through Jev with the messages that preceded it."""
     config, key_info = load_config(), load_key()
+    config = dict(config, change_check={"enabled": False})  # past commands vs today's diffs would be meaningless
     if key_info is None:
         print("No Jev key yet: put TYPESAFE_API_KEY or AI_GATEWAY_API_KEY in", ENV_PATH)
         return 1
@@ -415,7 +583,7 @@ def replay(limit=None):
                     append_log(REPLAY_LOG_PATH, {
                         "transcript": os.path.basename(path), "ts": row.get("timestamp"),
                         "command": redact(command)[:300], "user": user, "claude_last": claude_last,
-                        **{k: result[k] for k in ("hard_stops", "actions", "verdicts", "decision", "error", "ms", "tokens")},
+                        **{k: result[k] for k in ("hard_stops", "actions", "verdicts", "change", "decision", "error", "ms", "tokens")},
                     })
                     done += 1
                     if limit and done >= limit:

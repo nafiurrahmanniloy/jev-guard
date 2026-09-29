@@ -22,8 +22,8 @@ Your saved instructions are only reminders. A hook runs every single time.
    - Does this command really do it, or does it just mention it (like a `grep`
      for "git commit")?
    - Did the user clearly say yes to it in their last 3 messages?
-3. **Each action has its own bar**, set by what a mistake costs: merge 95%,
-   push 90%, commit 85%. Below the bar, Claude Code asks you. At or above it,
+3. **Each action has its own bar**, set by what a mistake costs: merge 85%,
+   push 80%, commit 70%. Below the bar, Claude Code asks you. At or above it,
    the command runs as normal.
 4. **Two things are always stopped** without asking Jev: `git add -A` / `git add .`
    and `git commit -a`, because they can sweep someone else's unfinished work
@@ -33,10 +33,36 @@ If Jev is down, slow (3 s timeout) or the key is missing, it asks you. It
 never silently lets a risky command through. And it never auto-approves
 anything: Claude Code's normal permission rules still apply on top.
 
+## Does the change match its description?
+
+Before a `git commit`, `gh pr create` or `gh pr merge`, Jev also reads the
+message and the diff: the staged changes plus any files `git add`-ed in the
+same command, or the PR's diff from GitHub. It asks "does this diff change
+code that has nothing to do with what the message says?" At 0.5 or above,
+Claude Code asks you, even if you said "commit" or "merge". Approval and
+content are separate checks.
+
+This catches a commit titled "hide the Billing page" that also deletes a
+backend job, or a `git add` that sweeps someone else's work into your commit.
+Tested on one real repo's history: the real incident scored 0.95, planted
+unrelated changes were caught 30/30, and 0/30 clean commits were flagged.
+
+## Saved-rules picker (optional)
+
+`pick_rules.py` runs on each message you send. Claude Code only loads the
+one-line index of a project's memories. This asks Jev which memories apply
+to your message and adds the **full text** of up to 3 (scoring ≥ 0.85) to
+Claude's context for that turn. It costs about $0.001 per message and adds
+about 0.5 s. In `"mode": "watch"` it only logs its picks to `rules_log.jsonl`;
+set `"mode": "on"` in the `rules_picker` block to use them. If Jev fails,
+nothing is added. It never blocks your message.
+
 ## What gets sent to Jev
 
 Only for risky commands: the command, the folder, the git branch, your last 3
-messages, and Claude's last message. **Secrets are stripped first**: database
+messages, and Claude's last message. For commits and PRs, also the message and
+the diff (capped at 60,000 characters). The rules picker sends each message
+you type plus Claude's previous message. **Secrets are stripped first**: database
 URLs, bearer tokens, API keys, `*_KEY=`/`*_TOKEN=` values, GitHub/Slack tokens,
 JWTs, and any long random-looking string. Names and other plain text in your
 messages are still sent. Decide if that's OK for your work.
@@ -77,12 +103,25 @@ You need Python 3.8+ (already on macOS and most Linux) and a Jev key. No
          {
            "type": "command",
            "command": "python3 \"$HOME/.claude/hooks/jev-guard/guard.py\"",
-           "timeout": 6
+           "timeout": 15
+         }
+       ]
+     }
+   ],
+   "UserPromptSubmit": [
+     {
+       "matcher": "",
+       "hooks": [
+         {
+           "type": "command",
+           "command": "python3 \"$HOME/.claude/hooks/jev-guard/pick_rules.py\"",
+           "timeout": 5
          }
        ]
      }
    ]
    ```
+   Leave out the `UserPromptSubmit` part if you don't want the rules picker.
 7. Restart Claude Code.
 
 It starts in **watch mode**: it only writes down what it *would* have done and
@@ -128,12 +167,13 @@ handle those.
 |---|---|
 | `guard.py` | The hook. Standard library only. |
 | `questions.example.json` | Starter rules. Copy to `questions.json`. |
+| `pick_rules.py` | The optional saved-rules picker hook. |
 | `test_guard.py` | Tests with a fake Jev (no key, no network). |
-| `questions.json`, `.env`, `log.jsonl`, `replay.jsonl` | Yours only. Git-ignored. |
+| `questions.json`, `.env`, `log.jsonl`, `rules_log.jsonl`, `replay.jsonl` | Yours only. Git-ignored. |
 
 ## Uninstall
 
-Remove the `PreToolUse` block from `~/.claude/settings.json`, then delete
+Remove the `PreToolUse` and `UserPromptSubmit` blocks from `~/.claude/settings.json`, then delete
 `~/.claude/hooks/jev-guard`.
 
 Not affiliated with TypeSafe or Anthropic. MIT license.
