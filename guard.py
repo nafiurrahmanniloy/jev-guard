@@ -442,12 +442,14 @@ def decide(actions, answers, config):
 def evaluate(command, cwd, messages, config, key_info, jev=None):
     """Core shared by the hook and --replay. Returns a result dict."""
     jev = jev or call_jev
-    result = {"hard_stops": [], "actions": [], "decision": "pass", "reason": None,
+    result = {"hard_stops": [], "actions": [], "decision": "pass", "reason": None, "enforced_reason": None,
               "verdicts": {}, "change": None, "error": None, "ms": None, "tokens": None}
     stops = match_hard_stops(command, config)
     if stops:
+        live = [h for h in stops if enforced(h)]
         result.update(hard_stops=[h["id"] for h in stops], decision="deny",
-                      reason="Jev rule check (hard stop): " + " ".join(h["reason"] for h in stops))
+                      reason="Jev rule check (hard stop): " + " ".join(h["reason"] for h in stops),
+                      enforced_reason=("Jev rule check (hard stop): " + " ".join(h["reason"] for h in live)) if live else None)
         return result
 
     actions = match_actions(command, config)
@@ -483,7 +485,7 @@ def evaluate(command, cwd, messages, config, key_info, jev=None):
             answers = resp.get("answers")
             verdicts, needs_ask = decide(actions, answers, config)
             result["verdicts"] = verdicts
-            parts = [f"{a['label']} (Jev is {round(p * 100)}% sure you said yes; needs {round(a['threshold'] * 100)}%)"
+            parts = [(f"{a['label']} (Jev is {round(p * 100)}% sure you said yes; needs {round(a['threshold'] * 100)}%)", enforced(a))
                      for a, p in needs_ask]
             if question:
                 unrelated = noul(answers, "change__unrelated")
@@ -491,10 +493,12 @@ def evaluate(command, cwd, messages, config, key_info, jev=None):
                 if unrelated >= cc["threshold"] and verdicts[change_action]["verdict"] != "skip":
                     label = next(a["label"] for a in actions if a["id"] == change_action)
                     files = result["change"]["files"]
-                    parts.append(f"{label}, but Jev is {round(unrelated * 100)}% sure it includes changes that don't match "
-                                 f"its description. Files: {', '.join(files[:8])}{' …' if len(files) > 8 else ''}")
+                    parts.append((f"{label}, but Jev is {round(unrelated * 100)}% sure it includes changes that don't match "
+                                  f"its description. Files: {', '.join(files[:8])}{' …' if len(files) > 8 else ''}", enforced(cc)))
             if parts:
-                result.update(decision="ask", reason="Jev rule check: about to " + "; ".join(parts) + ".")
+                live = [t for t, on in parts if on]
+                result.update(decision="ask", reason="Jev rule check: about to " + "; ".join(t for t, _ in parts) + ".",
+                              enforced_reason=("Jev rule check: about to " + "; ".join(live) + ".") if live else None)
             return result
         except urllib.error.HTTPError as e:
             result["error"] = f"HTTP {e.code}: {e.read()[:200].decode('utf-8', 'replace')}"
@@ -504,8 +508,20 @@ def evaluate(command, cwd, messages, config, key_info, jev=None):
 
     if config["on_error"] == "ask":
         labels = ", ".join(a["label"] for a in actions)
-        result.update(decision="ask", reason=f"Jev rule check could not reach Jev ({result['error'][:120]}). About to {labels}. Approve?")
+        reason = f"Jev rule check could not reach Jev ({result['error'][:120]}). About to {labels}. Approve?"
+        result.update(decision="ask", reason=reason, enforced_reason=reason if any_enforced(actions, command, config) else None)
     return result
+
+
+def enforced(item):
+    """An action, hard stop or the change check interrupts only when its `enforce` flag is on (default on)."""
+    return item.get("enforce", True)
+
+
+def any_enforced(actions, command, config):
+    cc = config.get("change_check") or {}
+    change = cc.get("enabled") and enforced(cc) and change_action_in(command, [a["id"] for a in actions])
+    return any(enforced(a) for a in actions) or bool(change)
 
 
 def append_log(path, entry):
@@ -542,18 +558,20 @@ def hook():
         result = {"hard_stops": [], "actions": [a["id"] for a in match_actions(command, config)], "verdicts": {},
                   "decision": "ask" if config["on_error"] == "ask" else "pass", "error": f"guard crash: {type(e).__name__}: {e}",
                   "reason": f"Jev rule check crashed ({type(e).__name__}). Approve this command yourself?", "change": None, "ms": None, "tokens": None}
+        result["enforced_reason"] = result["reason"] if any_enforced(match_actions(command, config), command, config) else None
     append_log(LOG_PATH, {
         "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "session": payload.get("session_id"),
         "mode": config["mode"], "folder": os.path.relpath(os.path.realpath(cwd), scope_roots(config)[0]),
         "command": redact(command)[:300],
         **{k: result[k] for k in ("hard_stops", "actions", "verdicts", "change", "decision", "error", "ms", "tokens")},
+        "interrupted": config["mode"] == "enforce" and bool(result.get("enforced_reason")),
     })
-    if config["mode"] != "enforce" or result["decision"] == "pass":
-        return 0
+    if config["mode"] != "enforce" or result["decision"] == "pass" or not result.get("enforced_reason"):
+        return 0  # watch mode, nothing to say, or only watch-only actions tripped: logged above, never interrupts
     print(json.dumps({"hookSpecificOutput": {
         "hookEventName": "PreToolUse",
         "permissionDecision": result["decision"],  # "ask" or "deny", never "allow"
-        "permissionDecisionReason": result["reason"],
+        "permissionDecisionReason": result["enforced_reason"],
     }}))
     return 0
 

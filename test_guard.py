@@ -393,6 +393,15 @@ class RulesPicker(unittest.TestCase):
         self.assertIsNone(ctx)
         self.assertIn("slow", entry["error"])
 
+    def test_task_notices_are_skipped(self):
+        import pick_rules
+        with tempfile.TemporaryDirectory() as tmp:
+            transcript = self.setup_dir(tmp)
+            jev = self.fake({"ask-before-paid-calls": 0.99})
+            ctx, entry = pick_rules.run({"prompt": "<task-notification>\n<status>done</status>", "transcript_path": transcript,
+                                         "cwd": IN_SCOPE}, CONFIG, KEY, jev)
+        self.assertEqual((ctx, entry, jev.calls), (None, None, []))
+
     def test_no_memory_folder_is_silent(self):
         import pick_rules
         ctx, entry = pick_rules.run({"prompt": "hi", "transcript_path": "/nonexistent/s.jsonl", "cwd": IN_SCOPE}, CONFIG, KEY, self.fake({}))
@@ -414,6 +423,60 @@ class RulesPicker(unittest.TestCase):
         hso = json.loads(out.getvalue())["hookSpecificOutput"]
         self.assertEqual(hso["hookEventName"], "UserPromptSubmit")
         self.assertIn("Full rule body about paid APIs.", hso["additionalContext"])
+
+
+class PerActionEnforce(unittest.TestCase):
+    """Option A: costly actions + change check interrupt; commit/push/PR only log."""
+    def cfg(self):
+        c = json.loads(json.dumps(CONFIG))
+        c["mode"] = "enforce"
+        for a in c["actions"]:
+            a["enforce"] = a["id"] not in ("commit", "push", "open_pr")
+        for h in c["hard_stops"]:
+            h["enforce"] = False
+        c["change_check"]["enforce"] = True
+        return c
+
+    def hook(self, command, jev, cwd=IN_SCOPE, cfg=None):
+        with tempfile.TemporaryDirectory() as tmp:
+            log = os.path.join(tmp, "log.jsonl")
+            payload = {"tool_name": "Bash", "tool_input": {"command": command}, "cwd": cwd, "transcript_path": "/nonexistent"}
+            out = io.StringIO()
+            with mock.patch.object(guard, "LOG_PATH", log), mock.patch.object(guard, "load_config", return_value=cfg or self.cfg()), \
+                 mock.patch.object(guard, "load_key", return_value=KEY), mock.patch.object(guard, "call_jev", jev), \
+                 mock.patch.object(sys, "stdin", io.StringIO(json.dumps(payload))), redirect_stdout(out):
+                guard.hook()
+            with open(log) as f:
+                return out.getvalue(), json.loads(f.read().splitlines()[-1])
+
+    def test_watch_only_action_logs_but_does_not_interrupt(self):
+        out, entry = self.hook("git push origin feat/x", fake_jev(approved=0.0))
+        self.assertEqual(out, "")
+        self.assertEqual((entry["decision"], entry["interrupted"]), ("ask", False))
+
+    def test_enforced_action_interrupts(self):
+        out, entry = self.hook("gh pr merge 5", fake_jev(approved=0.0))
+        self.assertEqual(json.loads(out)["hookSpecificOutput"]["permissionDecision"], "ask")
+        self.assertTrue(entry["interrupted"])
+
+    def test_change_check_interrupts_a_watch_only_commit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            git_repo(tmp)
+            cfg = dict(self.cfg(), scope=[tmp])
+            out, _ = self.hook("git add a.txt && git commit -m 'fix typo'", fake_jev(approved=0.0, unrelated=0.9), cwd=tmp, cfg=cfg)
+        reason = json.loads(out)["hookSpecificOutput"]["permissionDecisionReason"]
+        self.assertIn("don't match its description", reason)
+        self.assertNotIn("sure you said yes", reason)  # the commit-approval part stays log-only
+
+    def test_watch_only_hard_stop_logs(self):
+        out, entry = self.hook("git add -A", fake_jev())
+        self.assertEqual((out, entry["decision"], entry["interrupted"]), ("", "deny", False))
+
+    def test_jev_down_interrupts_only_for_enforced(self):
+        def broken(*a):
+            raise TimeoutError("down")
+        self.assertEqual(self.hook("git push origin x", broken)[0], "")
+        self.assertIn("could not reach Jev", self.hook("gh pr merge 5", broken)[0])
 
 
 class Config(unittest.TestCase):

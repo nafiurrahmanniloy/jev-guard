@@ -80,6 +80,8 @@ def run(payload, config, key_info, jev=None):
     prompt = (payload.get("prompt") or "").strip()
     if not settings.get("enabled") or not prompt or not guard.in_scope(payload.get("cwd") or "", config):
         return None, None
+    if prompt.startswith(guard._NOT_USER_WORDS):  # task notices, session summaries: not the user's words
+        return None, None
     transcript = payload.get("transcript_path") or ""
     mems = load_memories(os.path.join(os.path.dirname(transcript), "memory")) if transcript else []
     if not mems:
