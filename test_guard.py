@@ -18,6 +18,8 @@ CONFIG = guard.load_config(EXAMPLE)
 IN_SCOPE = os.path.expanduser("~/code/some-project")
 OUT_OF_SCOPE = "/tmp/elsewhere"
 KEY = ("https://example.invalid/v1/systemone", "jev-latest", "k")
+POPUPS = []
+guard.popup = POPUPS.append  # tests never show real Mac notifications
 
 
 def fake_jev(performs=0.95, approved=0.99, unrelated=0.05):
@@ -148,6 +150,20 @@ class Decisions(unittest.TestCase):
         self.assertEqual(r["decision"], "ask")  # merge needs 0.85
         self.assertIn("merge a pull request", r["reason"])
         self.assertIn("80%", r["reason"])
+
+    def test_unsure_is_logged_not_asked(self):
+        r = guard.evaluate("gh pr merge 1 --squash", IN_SCOPE, self.msgs, CONFIG, KEY, fake_jev(performs=0.5, approved=0.0))
+        self.assertEqual(r["decision"], "pass")
+        self.assertEqual(r["verdicts"]["merge_pr"]["verdict"], "unsure")
+
+    def test_sure_and_unapproved_still_asks(self):
+        r = guard.evaluate("gh pr merge 1 --squash", IN_SCOPE, self.msgs, CONFIG, KEY, fake_jev(performs=0.7, approved=0.0))
+        self.assertEqual(r["decision"], "ask")
+
+    def test_no_ask_bar_keeps_old_behaviour(self):
+        cfg = {k: v for k, v in CONFIG.items() if k != "performs_ask_from"}
+        r = guard.evaluate("gh pr merge 1 --squash", IN_SCOPE, self.msgs, cfg, KEY, fake_jev(performs=0.5, approved=0.0))
+        self.assertEqual(r["decision"], "ask")
 
     def test_one_request_all_questions(self):
         jev = fake_jev()
@@ -477,6 +493,142 @@ class PerActionEnforce(unittest.TestCase):
             raise TimeoutError("down")
         self.assertEqual(self.hook("git push origin x", broken)[0], "")
         self.assertIn("could not reach Jev", self.hook("gh pr merge 5", broken)[0])
+
+
+class Popups(unittest.TestCase):
+    """Push and PR pop up on the Mac; they stop only when Jev is sure the user never said yes."""
+    def cfg(self, mode="enforce"):
+        c = json.loads(json.dumps(CONFIG))
+        c["mode"] = mode
+        for a in c["actions"]:
+            if a["id"] in ("push", "open_pr"):
+                a["threshold"] = 0.15
+        return c
+
+    def hook(self, command, jev, mode="enforce"):
+        POPUPS.clear()
+        with tempfile.TemporaryDirectory() as tmp:
+            log = os.path.join(tmp, "log.jsonl")
+            payload = {"tool_name": "Bash", "tool_input": {"command": command}, "cwd": IN_SCOPE, "transcript_path": "/nonexistent"}
+            out = io.StringIO()
+            with mock.patch.object(guard, "LOG_PATH", log), mock.patch.object(guard, "load_config", return_value=self.cfg(mode)), \
+                 mock.patch.object(guard, "load_key", return_value=KEY), mock.patch.object(guard, "call_jev", jev), \
+                 mock.patch.object(sys, "stdin", io.StringIO(json.dumps(payload))), redirect_stdout(out):
+                guard.hook()
+            with open(log) as f:
+                return out.getvalue(), json.loads(f.read().splitlines()[-1]), list(POPUPS)
+
+    def test_approved_push_pops_up_and_runs(self):
+        out, entry, pops = self.hook("git push -q origin HEAD:fix/money", fake_jev(approved=0.4))
+        self.assertEqual(out, "")
+        self.assertEqual(pops, ["some-project: pushing fix/money"])
+        self.assertEqual(entry["popup"], pops[0])
+
+    def test_never_said_yes_stops_and_says_so(self):
+        out, _, pops = self.hook('gh pr create --base main --title "Real-time webhooks" --body x', fake_jev(approved=0.05))
+        self.assertEqual(json.loads(out)["hookSpecificOutput"]["permissionDecision"], "ask")
+        self.assertEqual(pops, ["some-project: opening PR 'Real-time webhooks' (waiting for your OK)"])
+
+    def test_push_and_pr_in_one_popup(self):
+        _, _, pops = self.hook('git push -u origin feat/x && gh pr create --title "T"', fake_jev(approved=0.9))
+        self.assertEqual(pops, ["some-project: pushing feat/x; opening PR 'T'"])
+
+    def test_unsure_or_mention_no_popup(self):
+        self.assertEqual(self.hook("git push origin feat/x", fake_jev(performs=0.5))[2], [])
+        self.assertEqual(self.hook('grep -rn "git push" docs', fake_jev(performs=0.05))[2], [])
+
+    def test_watch_mode_no_popup(self):
+        self.assertEqual(self.hook("git push origin feat/x", fake_jev(), mode="watch")[2], [])
+
+    def test_merge_does_not_pop_up(self):
+        self.assertEqual(self.hook("gh pr merge 5", fake_jev(approved=0.0))[2], [])
+
+    def test_push_target(self):
+        self.assertEqual(guard.push_target("git push -q origin HEAD:fix/a 2>&1 | tail -2", IN_SCOPE), "fix/a")
+        self.assertEqual(guard.push_target("git push -u origin feat/b", IN_SCOPE), "feat/b")
+        self.assertEqual(guard.push_target("git push origin +feat/c", IN_SCOPE), "feat/c")
+        with mock.patch.object(guard, "git_branch", return_value="main"):
+            self.assertEqual(guard.push_target("git push", IN_SCOPE), "main")
+
+
+DELETE_SCRIPT = """import pg from 'pg'
+const c = new pg.Client({ connectionString: process.env.DATABASE_URL })
+await c.connect(); await c.query('BEGIN')
+const r = await c.query('DELETE FROM reviews WHERE tenant_id = $1 AND id = ANY($2::uuid[])', [T, ids])
+await c.query('COMMIT')
+"""
+READ_SCRIPT = """import pg from 'pg'
+const c = new pg.Client({ connectionString: process.env.DATABASE_URL })
+console.log((await c.query('select count(*) from reviews')).rows)
+"""
+
+
+class Scripts(unittest.TestCase):
+    """A command that runs a local script is judged on the script's code (the delete-reviews.mjs shape)."""
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = self.tmp.name
+        for name, code in (("delete-reviews.mjs", DELETE_SCRIPT), ("count.mjs", READ_SCRIPT),
+                           ("ops.mjs", "await sb.from('ops_users').update({ active: false }).eq('id', id)\n"),
+                           ("cleanup.test.mjs", DELETE_SCRIPT)):
+            with open(os.path.join(self.dir, name), "w") as f:
+                f.write(code)
+        self.real = f"S={self.dir} && NODE_OPTIONS=--x=1 node --env-file=.env $S/delete-reviews.mjs"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def ids(self, command, cwd=IN_SCOPE):
+        return [a["id"] for a in guard.match_actions(command, CONFIG, guard.scripts_run(command, cwd))]
+
+    def test_the_real_shape_is_now_seen(self):
+        self.assertEqual(self.ids(self.real), ["db_write"])
+        jev = fake_jev(approved=0.0)
+        r = guard.evaluate(self.real, IN_SCOPE, [("user", "count the reviews")], CONFIG, KEY, jev)
+        self.assertEqual(r["decision"], "ask")
+        self.assertIn("change or delete rows", r["reason"])
+        sent = jev.calls[0]["state"]["scripts_run"][0]
+        self.assertTrue(sent["path"].endswith("delete-reviews.mjs"))
+        self.assertIn("DELETE FROM reviews", sent["code"])
+
+    def test_without_the_file_it_was_invisible(self):
+        self.assertEqual([a["id"] for a in guard.match_actions(self.real, CONFIG)], [])
+
+    def test_read_only_script_sends_nothing(self):
+        self.assertEqual(self.ids(f"node {self.dir}/count.mjs"), [])
+
+    def test_cd_then_relative_path(self):
+        self.assertEqual(self.ids(f"cd {self.dir} && node delete-reviews.mjs 2>&1 | tail -3"), ["db_write"])
+
+    def test_supabase_update(self):
+        self.assertEqual(self.ids(f"node {self.dir}/ops.mjs"), ["db_write"])
+
+    def test_tests_and_checks_are_skipped(self):
+        self.assertEqual(self.ids(f"node --test {self.dir}/cleanup.test.mjs"), [])
+        self.assertEqual(self.ids(f"node --check {self.dir}/delete-reviews.mjs"), [])
+
+    def test_unknown_variable_or_missing_file_is_skipped(self):
+        self.assertEqual(self.ids("node $NOPE_NOT_SET/delete-reviews.mjs"), [])
+        self.assertEqual(self.ids(f"node {self.dir}/gone.mjs"), [])
+
+    def test_heredoc_text_is_not_a_run(self):
+        cmd = f"git commit -q -F - <<'EOF'\nfix: node {self.dir}/delete-reviews.mjs no longer leaks\nEOF"
+        self.assertEqual(guard.scripts_run(cmd, IN_SCOPE), [])
+
+    def test_hook_stops_it_and_logs_the_script(self):
+        cfg = dict(CONFIG, mode="enforce")
+        with tempfile.TemporaryDirectory() as tmp:
+            log = os.path.join(tmp, "log.jsonl")
+            payload = {"tool_name": "Bash", "tool_input": {"command": self.real}, "cwd": IN_SCOPE, "transcript_path": "/nonexistent"}
+            out = io.StringIO()
+            with mock.patch.object(guard, "LOG_PATH", log), mock.patch.object(guard, "load_config", return_value=cfg), \
+                 mock.patch.object(guard, "load_key", return_value=KEY), mock.patch.object(guard, "call_jev", fake_jev(approved=0.0)), \
+                 mock.patch.object(sys, "stdin", io.StringIO(json.dumps(payload))), redirect_stdout(out):
+                guard.hook()
+            with open(log) as f:
+                entry = json.loads(f.read().splitlines()[-1])
+        self.assertEqual(json.loads(out.getvalue())["hookSpecificOutput"]["permissionDecision"], "ask")
+        self.assertTrue(entry["scripts"][0].endswith("delete-reviews.mjs"))
 
 
 class Config(unittest.TestCase):

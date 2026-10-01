@@ -40,6 +40,23 @@ Runs before every Bash command.
 - **Each action has its own bar, set by what a mistake costs:** merge,
   force-push, database and paid calls need 85%; push, PR and server 80%;
   commit 70%. Below the bar, Claude Code asks you.
+- **Scripts are read too.** `node delete-rows.mjs` hides its `DELETE` inside
+  the file. When a command runs a local script (`node`, `python3`, `tsx`,
+  `bash`, `sh`), the guard reads the file. If its code matches an action's
+  `script_pattern` (SQL deletes/updates, Supabase `.delete()`/`.update()`,
+  paid API hosts), Jev gets the code and judges what it does. Scripts that
+  only read cost nothing. It follows a leading `cd` and `S=… && node $S/x.mjs`
+  in the same command. Test runs (`--test`, `*.test.*`), `node --check` and a
+  `run-migrations.mjs` are skipped.
+- **Unsure means no stop.** If Jev is less than 70% sure the command really
+  does the risky thing, it only goes in the log (`performs_ask_from`). Without
+  this, half-sure guesses about `curl` and test runs were the biggest source of
+  stops.
+- **Pop-ups instead of stops (macOS).** Set `notify` on an action and you get a
+  Mac notification whenever Jev is sure it really happens, for example
+  "my-app: pushing fix/login" or "my-app: opening PR 'Fix login'". The session
+  keeps going. Push and open-PR have it on in the starter file. Pair it with a
+  low `threshold` (say 0.15) to stop only when Jev is sure you never said yes.
 
 ### 2. Change check: "does the change match its description?"
 
@@ -119,8 +136,15 @@ Be honest with yourself about these before installing:
   (it reads the PR from GitHub), and about 0.5 s per message for the rules
   picker.
 - **It's a seatbelt, not a lock.** The first filter is a pattern match. A command
-  written in an unusual way (a script that runs `git push` inside it) can get
-  past the pattern. It stops honest mistakes, not a determined bypass.
+  written in an unusual way can get past the pattern. It stops honest mistakes,
+  not a determined bypass. Reading scripts does **not** catch:
+  - a delete inside a module the script imports (only the file itself is read)
+  - SQL built from strings while the script runs
+  - a path in a variable set by an earlier command (`$J/x.mjs` with no `J=`)
+  - `npm run …` scripts
+  - git or ssh calls made from inside a script (only database and paid-API
+    patterns are checked in scripts)
+  - commands you type yourself with `!` in Claude Code: hooks never see them.
 - **Jev is weak at math, counting, dates and literal reading** (TypeSafe's own
   docs). So jev-guard never asks it things like "is CI green?" or "is this
   number right?".
@@ -245,7 +269,11 @@ Everything lives in `questions.json`:
 
 - `scope`: which folders are checked (default: your whole home folder).
 - `actions`: for each one, a `pattern` (does Jev get asked at all?), the two
-  questions Jev is asked, a `threshold`, and an `enforce` switch.
+  questions Jev is asked, a `threshold`, an `enforce` switch, and an optional
+  `notify` switch (Mac pop-up).
+- `performs_skip_below` / `performs_ask_from`: below the first, the command
+  only mentions the action and is ignored; between the two, Jev is unsure and
+  it is logged without stopping you.
 - `hard_stops`: stopped by pattern alone.
 - `change_check`: the question, the 50% bar, the diff size cap.
 - `rules_picker`: on/off, top 3, 85% bar.

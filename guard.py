@@ -46,6 +46,8 @@ MAX_MESSAGE_CHARS = 600    # per user message sent to Jev
 MAX_PLAN_CHARS = 4000     # an approved plan counts as a user message; keep enough of it to see its steps
 MAX_CLAUDE_CHARS = 800     # Claude's last message
 MAX_COMMAND_CHARS = 3000
+MAX_SCRIPT_CHARS = 12000   # per script file a command runs
+MAX_SCRIPTS = 3
 TAIL_BYTES = 400_000       # read only the end of the transcript
 
 ENDPOINTS = {
@@ -376,8 +378,46 @@ def match_hard_stops(command, config):
     return [h for h in config["hard_stops"] if re.search(h["pattern"], command, re.I | re.M)]
 
 
-def match_actions(command, config):
-    hits = [a for a in config["actions"] if re.search(a["pattern"], command, re.I | re.M)]
+# ── scripts: a command that runs a local file is judged on that file's code too ──
+_SCRIPT_RUN = re.compile(
+    r"(?:^|[;&|(]|\s)(?:node|python3?|tsx|ts-node|bun|bash|sh|zsh)((?:\s+-[-\w]+(?:=\S+)?)*)"
+    r"\s+(\"[^\"]+\"|'[^']+'|[^\s;&|<>()\"']+\.(?:mjs|cjs|js|ts|py|sh))(?=[\s;&|)]|$)")
+_ASSIGN = re.compile(r"(?:^|[;&|\s])([A-Za-z_]\w*)=(\"[^\"]*\"|'[^']*'|[^\s;&|]+)")
+
+
+def scripts_run(command, cwd):
+    """Local script files `command` runs with node/python/tsx/bash…, as [(path, code)]. `$VAR` resolves from
+    `VAR=…` set earlier in the same command. Tests, `--check` and the migration runner are skipped, and so is
+    any path that can't be resolved or read (README: what it does not catch)."""
+    try:
+        text, folder, found = strip_heredoc_bodies(command), effective_folder(command, cwd), []
+        for m in _SCRIPT_RUN.finditer(text):
+            flags, raw = m.group(1) or "", m.group(2).strip("'\"")
+            if re.search(r"--test\b|--check\b", flags) or re.search(r"\.(?:test|spec)\.", raw) \
+                    or os.path.basename(raw) == "run-migrations.mjs":
+                continue
+            env = {k: v.strip("'\"") for k, v in _ASSIGN.findall(text[:m.start()])}
+            path = os.path.expanduser(re.sub(r"\$\{?(\w+)\}?",
+                                             lambda v: env.get(v.group(1)) or os.environ.get(v.group(1)) or v.group(0), raw))
+            if "$" in path:
+                continue
+            path = path if os.path.isabs(path) else os.path.join(folder, path)
+            try:
+                with open(path, encoding="utf-8", errors="replace") as f:
+                    found.append((path, f.read(MAX_SCRIPT_CHARS)))
+            except OSError:
+                continue
+            if len(found) >= MAX_SCRIPTS:
+                break
+        return found
+    except Exception:  # reading scripts is a bonus; it must never break the command check
+        return []
+
+
+def match_actions(command, config, scripts=()):
+    code = "\n".join(c for _, c in scripts)
+    hits = [a for a in config["actions"] if re.search(a["pattern"], command, re.I | re.M)
+            or (code and a.get("script_pattern") and re.search(a["script_pattern"], code, re.I | re.M))]
     overridden = {o for a in hits for o in a.get("overrides", [])}
     return [a for a in hits if a["id"] not in overridden]
 
@@ -422,8 +462,9 @@ def noul(answers, qid):
 
 
 def decide(actions, answers, config):
-    """Per action: skip / ok / ask. Returns (verdicts, needs_ask list)."""
+    """Per action: skip / ok / unsure / ask. Returns (verdicts, needs_ask list)."""
     verdicts, needs_ask = {}, []
+    ask_from = config.get("performs_ask_from", config["performs_skip_below"])
     for a in actions:
         performs = noul(answers, f"{a['id']}__performs")
         approved = noul(answers, f"{a['id']}__approved")
@@ -431,6 +472,8 @@ def decide(actions, answers, config):
             verdict = "skip"
         elif approved >= a["threshold"]:
             verdict = "ok"
+        elif performs < ask_from:
+            verdict = "unsure"  # Jev doubts the command does it at all: log it, never stop for it
         else:
             verdict = "ask"
             needs_ask.append((a, approved))
@@ -439,9 +482,10 @@ def decide(actions, answers, config):
     return verdicts, needs_ask
 
 
-def evaluate(command, cwd, messages, config, key_info, jev=None):
+def evaluate(command, cwd, messages, config, key_info, jev=None, scripts=None):
     """Core shared by the hook and --replay. Returns a result dict."""
     jev = jev or call_jev
+    scripts = scripts_run(command, cwd) if scripts is None else scripts
     result = {"hard_stops": [], "actions": [], "decision": "pass", "reason": None, "enforced_reason": None,
               "verdicts": {}, "change": None, "error": None, "ms": None, "tokens": None}
     stops = match_hard_stops(command, config)
@@ -452,7 +496,7 @@ def evaluate(command, cwd, messages, config, key_info, jev=None):
                       enforced_reason=("Jev rule check (hard stop): " + " ".join(h["reason"] for h in live)) if live else None)
         return result
 
-    actions = match_actions(command, config)
+    actions = match_actions(command, config, scripts)
     result["actions"] = [a["id"] for a in actions]
     if not actions:
         return result
@@ -467,6 +511,9 @@ def evaluate(command, cwd, messages, config, key_info, jev=None):
         "user_recent_messages": user,
         "claude_last_message": claude_last,
     }
+    if scripts:
+        result["scripts"] = [p.replace(os.path.expanduser("~"), "~") for p, _ in scripts]
+        state["scripts_run"] = [{"path": p, "code": redact(c)} for p, (_, c) in zip(result["scripts"], scripts)]
     if key_info is None:
         result["error"] = "no Jev key (put TYPESAFE_API_KEY or AI_GATEWAY_API_KEY in .env)"
     else:
@@ -490,7 +537,7 @@ def evaluate(command, cwd, messages, config, key_info, jev=None):
             if question:
                 unrelated = noul(answers, "change__unrelated")
                 result["change"]["unrelated"] = round(unrelated, 3)
-                if unrelated >= cc["threshold"] and verdicts[change_action]["verdict"] != "skip":
+                if unrelated >= cc["threshold"] and verdicts[change_action]["verdict"] not in ("skip", "unsure"):
                     label = next(a["label"] for a in actions if a["id"] == change_action)
                     files = result["change"]["files"]
                     parts.append((f"{label}, but Jev is {round(unrelated * 100)}% sure it includes changes that don't match "
@@ -511,6 +558,54 @@ def evaluate(command, cwd, messages, config, key_info, jev=None):
         reason = f"Jev rule check could not reach Jev ({result['error'][:120]}). About to {labels}. Approve?"
         result.update(decision="ask", reason=reason, enforced_reason=reason if any_enforced(actions, command, config) else None)
     return result
+
+
+# ── pop-ups: tell the user what a session is doing without stopping it ──────
+_PUSH = re.compile(r"\bgit(?:\s+-C\s+\S+)?\s+push\b([^;&|\n]*)")
+
+
+def push_target(command, folder):
+    """Branch a `git push` sends: `origin HEAD:fix/x` -> fix/x, `origin feat/y` -> feat/y, bare push -> current branch."""
+    m = _PUSH.search(command)
+    args = [t for t in (m.group(1).split() if m else []) if not t.startswith("-") and not re.search(r"[<>]", t)]
+    if len(args) >= 2:
+        return args[-1].split(":")[-1].lstrip("+")
+    return git_branch(folder)
+
+
+def popup_text(command, cwd, actions, verdicts, config):
+    """One line naming each `notify` action Jev is sure really happens, or None."""
+    folder = effective_folder(command, cwd)
+    sure = config.get("performs_ask_from", config["performs_skip_below"])
+    parts = []
+    for a in actions:
+        v = verdicts.get(a["id"]) or {}
+        if not a.get("notify") or v.get("verdict") == "skip" or v.get("performs", 0) < sure:
+            continue
+        if a["id"] == "open_pr":
+            title = (_quoted_values(command, ["--title"]) or [None])[0]
+            parts.append(f"opening PR '{title[:60]}'" if title else "opening a PR")
+        elif a["id"] in ("push", "force_push"):
+            parts.append(f"pushing {push_target(command, folder) or 'a branch'}")
+        else:
+            parts.append(a["label"])
+        if v["verdict"] == "ask" and enforced(a):
+            parts[-1] += " (waiting for your OK)"
+    if not parts:
+        return None
+    return f"{os.path.basename(os.path.realpath(folder))}: " + "; ".join(parts)
+
+
+def popup(text):
+    """Mac notification; never blocks and never fails the hook."""
+    if sys.platform != "darwin":
+        return
+    try:
+        subprocess.Popen(["osascript", "-e", "on run argv", "-e",
+                          "display notification (item 1 of argv) with title \"Jev\"", "-e", "end run", text],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    except OSError:
+        pass
 
 
 def enforced(item):
@@ -548,23 +643,31 @@ def hook():
         return 0  # a broken rules file must never block work
     if not in_scope(cwd, config) or not command.strip():
         return 0
-    if not match_hard_stops(command, config) and not match_actions(command, config):
+    scripts = scripts_run(command, cwd)
+    actions = match_actions(command, config, scripts)
+    if not match_hard_stops(command, config) and not actions:
         return 0  # most commands: nothing read, nothing sent, nothing logged
 
     try:
         messages = recent_messages(payload.get("transcript_path") or "", config["recent_messages"])
-        result = evaluate(command, cwd, messages, config, load_key())
+        result = evaluate(command, cwd, messages, config, load_key(), scripts=scripts)
     except Exception as e:  # a crash on a risky command must be visible and fail to on_error, never silently pass
-        result = {"hard_stops": [], "actions": [a["id"] for a in match_actions(command, config)], "verdicts": {},
+        result = {"hard_stops": [], "actions": [a["id"] for a in actions], "verdicts": {},
                   "decision": "ask" if config["on_error"] == "ask" else "pass", "error": f"guard crash: {type(e).__name__}: {e}",
                   "reason": f"Jev rule check crashed ({type(e).__name__}). Approve this command yourself?", "change": None, "ms": None, "tokens": None}
-        result["enforced_reason"] = result["reason"] if any_enforced(match_actions(command, config), command, config) else None
+        result["enforced_reason"] = result["reason"] if any_enforced(actions, command, config) else None
+    note = popup_text(command, cwd, actions, result.get("verdicts") or {}, config) \
+        if config["mode"] == "enforce" else None
+    if note:
+        popup(note)
     append_log(LOG_PATH, {
         "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "session": payload.get("session_id"),
         "mode": config["mode"], "folder": os.path.relpath(os.path.realpath(cwd), scope_roots(config)[0]),
         "command": redact(command)[:300],
         **{k: result[k] for k in ("hard_stops", "actions", "verdicts", "change", "decision", "error", "ms", "tokens")},
+        "scripts": result.get("scripts"),
         "interrupted": config["mode"] == "enforce" and bool(result.get("enforced_reason")),
+        "popup": note,
     })
     if config["mode"] != "enforce" or result["decision"] == "pass" or not result.get("enforced_reason"):
         return 0  # watch mode, nothing to say, or only watch-only actions tripped: logged above, never interrupts
@@ -638,7 +741,7 @@ def replay(limit=None):
                     command, cwd = (c.get("input") or {}).get("command") or "", row.get("cwd") or ""
                     if not in_scope(cwd, config):
                         continue
-                    if not match_hard_stops(command, config) and not match_actions(command, config):
+                    if not match_hard_stops(command, config) and not match_actions(command, config, scripts_run(command, cwd)):
                         continue
                     messages = messages_from_rows(rows)
                     result = evaluate(command, cwd, messages, config, key_info)
